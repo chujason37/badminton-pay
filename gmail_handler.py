@@ -227,7 +227,7 @@ def _fetch_new_emails(service) -> list[tuple[str, str, str, datetime]]:
         }
         subject = headers.get("Subject", "")
 
-        if not re.search(r"received", subject, re.IGNORECASE):
+        if not re.search(r"received|已收到|收到.*付款", subject, re.IGNORECASE):
             continue
 
         date_str = headers.get("Date", "")

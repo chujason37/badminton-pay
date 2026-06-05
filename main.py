@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -9,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from telegram.ext import Application
 
 from bot import create_application, send_payment_notification
+from gmail_handler import gmail_poll_loop
 from models import init_db
 from wise_handler import process_wise_event
 
@@ -30,7 +32,30 @@ async def lifespan(_: FastAPI):
         await telegram_app.start()
         await telegram_app.updater.start_polling()
         logger.info("Telegram bot polling started")
+
+        async def _notify(result: dict) -> None:
+            if telegram_app:
+                await send_payment_notification(
+                    telegram_app,
+                    result["payment_id"],
+                    result["matches"],
+                    result["amount"],
+                    result["currency"],
+                    result["reference"],
+                    result["sender_name"],
+                    result["timestamp"],
+                )
+
+        poll_task = asyncio.create_task(gmail_poll_loop(_notify))
+
         yield
+
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
+
         await telegram_app.updater.stop()
         await telegram_app.stop()
     logger.info("Telegram bot stopped")

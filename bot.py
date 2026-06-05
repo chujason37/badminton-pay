@@ -86,6 +86,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏸 *Badminton Pay Bot*\n\n"
         "/newsession — create session from 接龙 message\n"
         "/session — create session manually\n"
+        "/sessions — list all sessions\n"
+        "/deletesession — delete a session\n"
         "/unpaid — who hasn't paid\n"
         "/paid — who has paid\n"
         "/status <name> — individual status\n\n"
@@ -366,6 +368,55 @@ async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
+# ─── /sessions ───────────────────────────────────────────────────────────────
+
+@_admin_only
+async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = SessionLocal()
+    try:
+        sessions = db.query(GameSession).order_by(GameSession.id.desc()).all()
+        if not sessions:
+            await update.message.reply_text("No sessions yet. Use /newsession to create one.")
+            return
+        lines = []
+        for sess in sessions:
+            total = len(sess.entries)
+            paid = sum(1 for e in sess.entries if e.paid)
+            unpaid = total - paid
+            lines.append(f"• *{sess.date}* @ {sess.location}  ✅{paid} ❌{unpaid}")
+        await update.message.reply_text(
+            f"📋 *All Sessions ({len(sessions)})*\n\n" + "\n".join(lines),
+            parse_mode="Markdown",
+        )
+    finally:
+        db.close()
+
+
+# ─── /deletesession ───────────────────────────────────────────────────────────
+
+@_admin_only
+async def cmd_deletesession(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = SessionLocal()
+    try:
+        sessions = db.query(GameSession).order_by(GameSession.id.desc()).all()
+        if not sessions:
+            await update.message.reply_text("No sessions to delete.")
+            return
+        keyboard = []
+        for sess in sessions:
+            total = len(sess.entries)
+            paid = sum(1 for e in sess.entries if e.paid)
+            label = f"{sess.date} @ {sess.location} ({paid}/{total} paid)"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"delsess_pick:{sess.id}")])
+        await update.message.reply_text(
+            "🗑 *Which session do you want to delete?*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+    finally:
+        db.close()
+
+
 # ─── /status ─────────────────────────────────────────────────────────────────
 
 @_admin_only
@@ -435,6 +486,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query.message.text + "\n\n✏️ *Reply with the player's name:*",
                 parse_mode="Markdown",
             )
+
+        elif action == "delsess_pick":
+            session_id = int(parts[1])
+            sess = db.get(GameSession, session_id)
+            if not sess:
+                await query.edit_message_text("❌ Session not found.")
+                return
+            total = len(sess.entries)
+            paid = sum(1 for e in sess.entries if e.paid)
+            keyboard = [[
+                InlineKeyboardButton("🗑 Yes, delete", callback_data=f"delsess_confirm:{session_id}"),
+                InlineKeyboardButton("Cancel", callback_data="delsess_cancel"),
+            ]]
+            await query.edit_message_text(
+                f"⚠️ *Delete this session?*\n\n"
+                f"📅 {sess.date} @ {sess.location}\n"
+                f"👥 {total} players, {paid} paid\n\n"
+                f"This cannot be undone.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown",
+            )
+
+        elif action == "delsess_confirm":
+            session_id = int(parts[1])
+            sess = db.get(GameSession, session_id)
+            if not sess:
+                await query.edit_message_text("❌ Session not found.")
+                return
+            label = f"{sess.date} @ {sess.location}"
+            for entry in list(sess.entries):
+                db.delete(entry)
+            db.delete(sess)
+            db.commit()
+            await query.edit_message_text(f"🗑 Session *{label}* deleted.", parse_mode="Markdown")
+
+        elif action == "delsess_cancel":
+            await query.edit_message_text("Cancelled.")
+
     finally:
         db.close()
 
@@ -635,6 +724,8 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(session_conv)
     app.add_handler(newsession_conv)
+    app.add_handler(CommandHandler("sessions", cmd_sessions))
+    app.add_handler(CommandHandler("deletesession", cmd_deletesession))
     app.add_handler(CommandHandler("unpaid", cmd_unpaid))
     app.add_handler(CommandHandler("paid", cmd_paid))
     app.add_handler(CommandHandler("status", cmd_status))

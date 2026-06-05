@@ -88,8 +88,10 @@ def _strip_html(text: str) -> str:
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
-    for entity, replacement in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
-                                  ("&nbsp;", " "), ("&quot;", '"'), ("&#39;", "'")]:
+    for entity, replacement in [
+        ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " "),
+        ("&quot;", '"'), ("&#39;", "'"), ("&zwnj;", ""), ("&#8202;", ""),
+    ]:
         text = text.replace(entity, replacement)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -98,63 +100,85 @@ def _strip_html(text: str) -> str:
 
 def _parse_wise_email(subject: str, body: str) -> dict | None:
     """
-    Extract payment details from a Wise "You've received" notification email.
+    Extract payment details from a Wise payment notification email.
+    Supports Traditional Chinese (已收到來自…) and English (You've received…) formats.
     Returns dict with amount/currency/sender_name/reference, or None if not a payment email.
     """
-    body_text = _strip_html(body) if "<html" in body.lower() or "<div" in body.lower() else body
-
-    # Amount from subject: "You've received £20.00" or "received 20.00 GBP"
-    amt_m = re.search(
-        r"received\s+[£$€]?\s*([\d,]+\.?\d*)\s*(GBP|USD|EUR|HKD|SGD|AUD|CAD)?",
-        subject, re.IGNORECASE,
+    is_payment = bool(
+        re.search(r"received", subject, re.IGNORECASE)
+        or re.search(r"已收到|收到.*付款", subject)
     )
-    if not amt_m:
+    if not is_payment:
         return None
 
-    try:
-        amount = float(amt_m.group(1).replace(",", ""))
-    except ValueError:
-        return None
+    body_text = _strip_html(body) if ("<html" in body.lower() or "<div" in body.lower()) else body
 
-    # Currency: symbol takes priority over code suffix
+    # ── Amount ────────────────────────────────────────────────────────────────
+    # Wise emails (Chinese): "已收到的金額： 1 GBP"
+    # Wise emails (English): "Amount received: £20.00" or "received £20.00 GBP"
+    amount: float | None = None
     currency = "GBP"
+
+    for pat in [
+        # Chinese label in body: 已收到的金額： 1 GBP
+        r"已收到的金額[：:]\s*([\d,]+\.?\d*)\s*(GBP|USD|EUR|HKD|SGD|AUD|CAD)",
+        # Inline Chinese body sentence: 已收到來自…的1 GBP付款
+        r"已收到來自.+?的\s*([\d,]+\.?\d*)\s*(GBP|USD|EUR|HKD|SGD|AUD|CAD)\s*付款",
+        # English label in body
+        r"Amount\s+received[：:]\s*[£$€]?\s*([\d,]+\.?\d*)\s*(GBP|USD|EUR|HKD|SGD|AUD|CAD)?",
+        # English subject: "You've received £20.00"
+        r"received\s+[£$€]?\s*([\d,]+\.?\d*)\s*(GBP|USD|EUR|HKD|SGD|AUD|CAD)?",
+    ]:
+        m = re.search(pat, body_text + " " + subject, re.IGNORECASE)
+        if m:
+            try:
+                amount = float(m.group(1).replace(",", ""))
+                if m.lastindex >= 2 and m.group(2):
+                    currency = m.group(2).upper()
+                break
+            except (ValueError, AttributeError):
+                pass
+
+    # Currency symbol fallback from subject
     if "£" in subject:
         currency = "GBP"
     elif "€" in subject:
         currency = "EUR"
-    elif "$" in subject:
+    elif "$" in subject and currency == "GBP":
         currency = "USD"
-    elif amt_m.group(2):
-        currency = amt_m.group(2).upper()
 
-    # Sender name — try subject first, then body
+    if amount is None:
+        return None
+
+    # ── Sender name ───────────────────────────────────────────────────────────
+    # After HTML stripping everything is one line, so use lookaheads to stop at the next label.
+    # Chinese: 來自： Ka Chun Chu [stops before 已收到的金額 / 附註 / 匯款編號]
+    # English: From: John Smith
+    _NEXT_LABEL = r"(?=\s*(?:已收到的金額|匯款編號|附註|Amount received|Reference|看看Wise|Wise團隊|$))"
     sender_name = ""
-    subj_sender = re.search(
-        r"received.+?from\s+(.+?)(?:\s*$|\s+on\b|\s+via\b|\s+\()", subject, re.IGNORECASE
-    )
-    if subj_sender:
-        sender_name = subj_sender.group(1).strip().rstrip(".")
-    if not sender_name:
-        for pat in [
-            r"(?:From|Sender|Sent by)[:\s]+([A-Za-z一-鿿][^\n<]{2,50})",
-            r"payment\s+from\s+([A-Za-z一-鿿][^\n<]{2,50})",
-            r"received\s+from\s+([A-Za-z一-鿿][^\n<]{2,50})",
-        ]:
-            m = re.search(pat, body_text, re.IGNORECASE)
-            if m:
-                candidate = m.group(1).strip().rstrip(".")
-                # Reject obvious non-names
-                if len(candidate) >= 2 and not re.search(r"\b(wise|bank|payment)\b", candidate, re.IGNORECASE):
-                    sender_name = candidate
-                    break
+    for pat in [
+        r"來自[：:]\s*(.+?)" + _NEXT_LABEL,
+        r"(?:From|Sender|Sent\s+by)[：:\s]+(.+?)" + _NEXT_LABEL,
+        r"已收到來自(.+?)的[\d]",
+        r"received.+?from\s+(.+?)(?:\s*$|\s+on\b|\s+via\b|\s+\()",
+    ]:
+        m = re.search(pat, body_text, re.IGNORECASE | re.DOTALL)
+        if m:
+            candidate = m.group(1).strip().rstrip(".")
+            if len(candidate) >= 2 and not re.search(r"\b(wise|bank|payment)\b", candidate, re.IGNORECASE):
+                sender_name = candidate
+                break
 
-    # Payment reference — in body
+    # ── Payment reference ─────────────────────────────────────────────────────
+    # Chinese: 附註： Jason  [stops before 匯款編號]
+    # English: Reference: chenwei
+    _NEXT_REF_LABEL = r"(?=\s*(?:匯款編號|看看Wise|Wise團隊|$))"
     reference = ""
     for pat in [
-        r"(?:Payment\s+reference|Reference|Ref)[:\s]+([^\n<]{1,100})",
-        r"reference\s+number[:\s]+([^\n<]{1,100})",
+        r"附註[：:]\s*(.+?)" + _NEXT_REF_LABEL,
+        r"(?:Payment\s+reference|Reference|Ref)[：:\s]+(.+?)" + _NEXT_REF_LABEL,
     ]:
-        m = re.search(pat, body_text, re.IGNORECASE)
+        m = re.search(pat, body_text, re.IGNORECASE | re.DOTALL)
         if m:
             candidate = m.group(1).strip()
             if candidate.lower() not in ("none", "n/a", "-", "no reference", ""):
@@ -179,7 +203,7 @@ def _fetch_new_emails(service) -> list[tuple[str, str, str, datetime]]:
     try:
         result = service.users().messages().list(
             userId="me",
-            q="from:wise.com subject:received newer_than:1d",
+            q="from:wise.com newer_than:1d",
             maxResults=20,
         ).execute()
     except HttpError as e:
